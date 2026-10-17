@@ -1,0 +1,98 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+// 确保删除了过时的 apply plugin: 'kotlin-android-extensions'
+
+android {
+    // 现代编译器强制要求的编译 SDK 版本
+    namespace "com.tencent.qgame.animplayer"
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
+
+        externalNativeBuild {
+            ndkBuild {
+                arguments "NDK_APPLICATION_MK=src/main/jni/Application.mk"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        ndkBuild {
+            path file('src/main/jni/Android.mk')
+        }
+    }
+
+    // 1. 显式配置 Java 编译器的目标版本为 17
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 2. 显式配置 Kotlin 编译器的目标版本为 17
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+//    repositories {
+//        flatDir {
+//            dirs 'libs'
+//        }
+//    }
+
+//    sourceSets {
+//        main {
+//            // 如果你把 .so 文件放在了 libs 目录下，必须这样指明
+//            jniLibs.srcDirs = ['libs']
+//        }
+//    }
+}
+
+dependencies {
+    // 现代标准写法，去除过时的 jdk7 后缀
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    implementation "com.tencent.qgame:ffmpeg-lite:1.0.0"
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+
+}
+
+def prepareFfmpegLiteNative = tasks.register("prepareFfmpegLiteNative") {
+    def prefixDir = file("${rootDir}/.ffmpeg-lite-build/prefix")
+    def includeDir = file("src/main/jni/ffmpeg-include")
+    def jniLibsDir = file("${rootDir}/local-maven-tmp/ffmpeg-lite/jni")
+    inputs.dir(jniLibsDir)
+    inputs.dir(includeDir)
+    outputs.dir(prefixDir)
+    doLast {
+        ["arm64-v8a", "armeabi-v7a"].each { abi ->
+            copy {
+                from("${jniLibsDir}/${abi}")
+                include "*.so"
+                into("${prefixDir}/${abi}/lib")
+            }
+            copy {
+                from(includeDir)
+                into("${prefixDir}/${abi}/include")
+            }
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name.startsWith("configureNdkBuild") || task.name.startsWith("buildNdkBuild")) {
+        task.dependsOn prepareFfmpegLiteNative
+    }
+}

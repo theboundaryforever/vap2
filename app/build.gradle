@@ -1,0 +1,56 @@
+apply plugin: 'com.android.application'
+
+apply plugin: 'kotlin-android'
+
+//apply plugin: 'kotlin-android-extensions'
+
+android {
+    namespace "com.tencent.qgame.playerproj"
+    compileSdkVersion 33
+    defaultConfig {
+        applicationId "com.tencent.qgame.playerproj"
+        minSdkVersion 24
+        targetSdkVersion 33
+        versionCode 1
+        versionName "1.0"
+        ndk {
+            // FFmpegKit's 32-bit package uses an internal NEON loader; keep the full ABI set.
+            abiFilters "arm64-v8a","armeabi-v7a"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 2. 显式配置 Kotlin 编译器的目标版本为 17
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    lintOptions {
+        abortOnError false
+    }
+
+    buildFeatures {
+        viewBinding true
+    }
+
+}
+
+dependencies {
+    //implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    implementation project(":animplayer")
+
+    // 删除旧引用
+// implementation("com.arthenica:mobile-ffmpeg-full:4.4")
+
+
+}

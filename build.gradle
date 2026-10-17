@@ -1,0 +1,30 @@
+buildscript {
+    // 现代编译器下，Kotlin 必须升级到 1.9.22 或更高版本才能兼容 Gradle 8.9
+    ext.kotlin_version = '1.9.22'
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/public/' }
+    }
+    dependencies {
+        // 强制对齐你的编译器最低要求的 8.7.0
+        classpath 'com.android.tools.build:gradle:8.7.0'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+
+
+}
+
+allprojects {
+    repositories {
+        maven { url uri("${rootDir}/local-maven") }
+        google()
+        mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/public/' }
+    }
+    tasks.withType(Javadoc).all { enabled = false }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
