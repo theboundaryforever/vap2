@@ -65,7 +65,9 @@ android {
 dependencies {
     // 现代标准写法，去除过时的 jdk7 后缀
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
-    implementation "com.tencent.qgame:ffmpeg-lite:1.0.0"
+    // ffmpeg-lite 只在 ndk-build 时提供预编译 .so，产物已经打进 animplayer.aar。
+    // 不要声明成 Maven 依赖：JitPack 会扫描 local-maven 里的 pom，把坐标改写成
+    // com.github.theboundaryforever.vap2:ffmpeg-lite，但不会发布这个模块。
     if (file('libs').directory) {
         implementation fileTree(dir: 'libs', include: ['*.jar'])
     }
