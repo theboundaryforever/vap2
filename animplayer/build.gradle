@@ -1,5 +1,6 @@
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
+apply plugin: 'maven-publish'
 // 确保删除了过时的 apply plugin: 'kotlin-android-extensions'
 
 android {
@@ -65,27 +66,58 @@ dependencies {
     // 现代标准写法，去除过时的 jdk7 后缀
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
     implementation "com.tencent.qgame:ffmpeg-lite:1.0.0"
-    implementation fileTree(dir: 'libs', include: ['*.jar'])
-
+    if (file('libs').directory) {
+        implementation fileTree(dir: 'libs', include: ['*.jar'])
+    }
 }
 
+// JitPack clones the git repo only. local-maven-tmp is gitignored, so extract
+// the committed AAR instead of requiring a pre-unpacked jni directory.
+def ffmpegLiteAar = rootProject.file("local-maven/com/tencent/qgame/ffmpeg-lite/1.0.0/ffmpeg-lite-1.0.0.aar")
+
 def prepareFfmpegLiteNative = tasks.register("prepareFfmpegLiteNative") {
-    def prefixDir = file("${rootDir}/.ffmpeg-lite-build/prefix")
+    def prefixDir = rootProject.file(".ffmpeg-lite-build/prefix")
     def includeDir = file("src/main/jni/ffmpeg-include")
-    def jniLibsDir = file("${rootDir}/local-maven-tmp/ffmpeg-lite/jni")
-    inputs.dir(jniLibsDir)
+    def extractRoot = rootProject.file("local-maven-tmp/ffmpeg-lite")
+    def jniLibsDir = new File(extractRoot, "jni")
+    inputs.file(ffmpegLiteAar)
     inputs.dir(includeDir)
     outputs.dir(prefixDir)
+    outputs.dir(jniLibsDir)
     doLast {
+        if (!ffmpegLiteAar.isFile()) {
+            throw new GradleException("Missing ffmpeg-lite AAR: ${ffmpegLiteAar}")
+        }
+        extractRoot.deleteDir()
+        copy {
+            from(zipTree(ffmpegLiteAar))
+            include "jni/**/*.so"
+            into(extractRoot)
+        }
         ["arm64-v8a", "armeabi-v7a"].each { abi ->
+            def abiLibs = new File(jniLibsDir, abi)
+            if (!abiLibs.directory || abiLibs.listFiles()?.length == 0) {
+                throw new GradleException("ffmpeg-lite AAR has no native libs for ${abi}: ${ffmpegLiteAar}")
+            }
             copy {
-                from("${jniLibsDir}/${abi}")
+                from(abiLibs)
                 include "*.so"
                 into("${prefixDir}/${abi}/lib")
             }
             copy {
                 from(includeDir)
                 into("${prefixDir}/${abi}/include")
+            }
+        }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                artifactId = 'animplayer'
             }
         }
     }

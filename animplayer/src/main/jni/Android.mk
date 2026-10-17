@@ -1,5 +1,6 @@
 LOCAL_PATH := $(call my-dir)
-# Prebuilt .so files are committed under local-maven-tmp; headers live next to this makefile.
+# prepareFfmpegLiteNative extracts these .so files from the committed ffmpeg-lite AAR.
+# Headers live next to this makefile.
 FFMPEG_LIBS := $(LOCAL_PATH)/../../../../local-maven-tmp/ffmpeg-lite/jni/$(TARGET_ARCH_ABI)
 FFMPEG_INCLUDE := $(LOCAL_PATH)/ffmpeg-include
 FFMPEG_PREFIX := $(LOCAL_PATH)/../../../../.ffmpeg-lite-build/prefix/$(TARGET_ARCH_ABI)

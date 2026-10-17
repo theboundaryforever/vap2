@@ -1,7 +1,19 @@
 apply plugin: 'java-library'
+apply plugin: 'maven-publish'
 
 dependencies {
-    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    if (file('libs').directory) {
+        implementation fileTree(dir: 'libs', include: ['*.jar'])
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            artifactId = 'animtool'
+        }
+    }
 }
 
 // 提升到至少 Java 8

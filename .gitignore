@@ -13,6 +13,5 @@ build/
 .cxx
 gradle.properties
 .tools/
-local-maven-tmp/
 /.ffmpeg-lite-build/*
 !/.ffmpeg-lite-build/FFmpeg
