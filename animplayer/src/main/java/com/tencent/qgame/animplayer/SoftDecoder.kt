@@ -107,7 +107,12 @@ class SoftDecoder(player: AnimPlayer) : Decoder(player) {
             config?.width ?: 0,
             config?.height ?: 0,
             player.outputSurfaceWidth,
-            player.outputSurfaceHeight
+            player.outputSurfaceHeight,
+            if (player.lowMemoryMode) {
+                player.lowMemoryMaxVideoPixels
+            } else {
+                Int.MAX_VALUE
+            }
         )
         if (decodeWidth != videoWidth || decodeHeight != videoHeight) {
             ALog.i(TAG, "scale decode ${videoWidth}x$videoHeight -> ${decodeWidth}x$decodeHeight")

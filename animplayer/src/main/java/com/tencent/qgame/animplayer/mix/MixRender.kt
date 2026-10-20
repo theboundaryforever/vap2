@@ -61,6 +61,7 @@ class MixRender(private val mixAnimPlugin: MixAnimPlugin) {
         }
         if (textureId == 0) return
         src.srcTextureId = textureId
+        mixAnimPlugin.onTextureUploaded(src, upload.width, upload.height)
         mixAnimPlugin.releaseSrcAfterUpload(src)
         ALog.i(TAG, "upload srcId=${src.srcId} textureId=$textureId")
     }

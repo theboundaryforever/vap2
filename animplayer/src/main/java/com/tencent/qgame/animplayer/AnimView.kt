@@ -263,6 +263,17 @@ open class AnimView @JvmOverloads constructor(context: Context, attrs: Attribute
         player.isMute = isMute
     }
 
+    override fun setLowMemoryMode(enable: Boolean) {
+        setLowMemoryMode(enable, AnimPlayer.DEFAULT_LOW_MEMORY_MAX_VIDEO_PIXELS)
+    }
+
+    override fun setLowMemoryMode(enable: Boolean, maxVideoPixels: Int) {
+        require(maxVideoPixels > 0) { "maxVideoPixels must be positive" }
+        player.lowMemoryMode = enable
+        player.lowMemoryMaxVideoPixels = maxVideoPixels
+        ALog.i(TAG, "setLowMemoryMode enable=$enable, maxVideoPixels=$maxVideoPixels")
+    }
+
     override fun startPlay(file: File) {
         try {
             val fileContainer = FileContainer(file)

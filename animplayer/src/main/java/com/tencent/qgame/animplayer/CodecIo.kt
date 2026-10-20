@@ -91,7 +91,8 @@ internal class BlockCodecIo private constructor(
         private const val BLOCK_ALIGN = 4096
 
         /**
-         * 解码器能直接读 app 分配的 LinearBlock 时才走 block 模式，否则每帧还要多拷一次。
+         * 解码器能直接读 app 分配的 LinearBlock 时不用再拷一次。
+         * 不能零拷贝时仍然走 block 模式，否则同步模式会一次分配整组输入缓冲。
          */
         fun isSupported(codec: MediaCodec): Boolean {
             return try {

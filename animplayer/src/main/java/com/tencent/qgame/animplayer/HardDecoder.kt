@@ -39,7 +39,7 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         private const val PRESENT_WAIT_MS = 800L
         // 解码比正在显示的画面超前的样本数。再多，解码器就会把输出池里的全尺寸画面填满。
         private const val MAX_FRAMES_AHEAD = 1
-        private const val MAX_EXTRA_AHEAD = 4
+        private const val MAX_EXTRA_AHEAD = 1
     }
 
     private var surface: Surface? = null
@@ -235,7 +235,13 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                 return
             }
 
-            val aheadLimit = MAX_FRAMES_AHEAD + extraAhead
+            // Allow a caller to choose the conservative one-frame policy. Never allow
+            // more than one additional full-size codec output buffer.
+            val configuredLimit = player.maxHardwareFramesAhead.coerceIn(
+                MAX_FRAMES_AHEAD,
+                MAX_FRAMES_AHEAD + MAX_EXTRA_AHEAD
+            )
+            val aheadLimit = minOf(configuredLimit, MAX_FRAMES_AHEAD + extraAhead)
             while (!inputDone && framesAhead < aheadLimit) {
                 val inputBufIndex = decoder.dequeueInput(if (inputChunk == 0) TIMEOUT_USEC else 0L)
                 if (inputBufIndex < 0) {
@@ -263,8 +269,11 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                 when {
                     decoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                         if (ALog.isDebug) ALog.d(TAG, "no output from decoder available")
-                        if (hitAheadLimit && extraAhead < MAX_EXTRA_AHEAD) {
+                        if (hitAheadLimit && extraAhead < MAX_EXTRA_AHEAD &&
+                            configuredLimit > MAX_FRAMES_AHEAD
+                        ) {
                             extraAhead++
+                            ALog.d(TAG, "output delayed; permitting one extra sample")
                         }
                     }
                     decoderStatus == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> ALog.d(TAG, "decoder output buffers changed")
@@ -333,21 +342,22 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         val tuned = copyVideoFormat(format)
         applyDecoderMemoryHints(tuned)
         var decoder = openDecoder(mime, width, height)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && BlockCodecIo.isSupported(decoder)) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
+                val copyFree = BlockCodecIo.isSupported(decoder)
                 val io = BlockCodecIo.configure(decoder, tuned, outputSurface)
-                ALog.i(TAG, "decoder configured block model codec=${decoder.name} ${width}x$height")
+                ALog.i(TAG, "memory-path=block codec=${decoder.name} ${width}x$height copyFree=$copyFree")
                 return io
             } catch (t: Throwable) {
-                ALog.e(TAG, "block model configure failed, use buffer mode", t)
+                ALog.e(TAG, "memory-path=block-fallback-buffer configure failed", t)
                 releaseCodecQuietly(decoder)
                 decoder = openDecoder(mime, width, height)
             }
         }
-        // 不设实时优先级和低延迟。这两个标记会让解码器在 configure 时多留输出画面，开播内存会更高。
+        // 不设低延迟。这个标记会让解码器在 configure 时多留输出画面，开播内存会更高。
         return try {
             decoder.configure(tuned, outputSurface, null, 0)
-            ALog.i(TAG, "decoder configured codec=${decoder.name} ${width}x$height max=${tuned.getInteger(MediaFormat.KEY_MAX_WIDTH)}x${tuned.getInteger(MediaFormat.KEY_MAX_HEIGHT)}")
+            ALog.i(TAG, "memory-path=buffer codec=${decoder.name} ${width}x$height max=${tuned.getInteger(MediaFormat.KEY_MAX_WIDTH)}x${tuned.getInteger(MediaFormat.KEY_MAX_HEIGHT)}")
             SyncCodecIo(decoder)
         } catch (t: Throwable) {
             ALog.e(TAG, "memory-tuned configure failed, fallback", t)
@@ -397,6 +407,10 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         val alignedHeight = (height + 15) / 16 * 16
         format.setInteger(MediaFormat.KEY_MAX_WIDTH, alignedWidth)
         format.setInteger(MediaFormat.KEY_MAX_HEIGHT, alignedHeight)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // 0 是实时优先级，解码器会按实时播放多留输出画面。这里显式要非实时。
+            format.setInteger(MediaFormat.KEY_PRIORITY, 1)
+        }
     }
 
     private fun suggestedMaxInputSize(mime: String, width: Int, height: Int): Int {
@@ -495,6 +509,7 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                 render = null
             }
             isRunning = false
+            player.logMemoryBudget("hard-release")
             // 降级软解时不要触发 complete，否则 AnimView.hide() 会销毁 Surface
             if (!player.isDegrading) {
                 onVideoComplete()

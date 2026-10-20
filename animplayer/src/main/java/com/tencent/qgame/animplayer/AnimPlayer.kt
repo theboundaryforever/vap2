@@ -25,6 +25,7 @@ class AnimPlayer(val animView: IAnimView) {
 
     companion object {
         private const val TAG = "${Constant.TAG}.AnimPlayer"
+        const val DEFAULT_LOW_MEMORY_MAX_VIDEO_PIXELS = 1_200_000
     }
 
     val context: android.content.Context
@@ -62,6 +63,16 @@ class AnimPlayer(val animView: IAnimView) {
     var startRunnable: Runnable? = null
     var isStartRunning = false // 启动时运行状态
     var isMute = false // 是否静音
+    var lowMemoryMode = false
+    var lowMemoryMaxVideoPixels = DEFAULT_LOW_MEMORY_MAX_VIDEO_PIXELS
+    /**
+     * Limits hardware-decoder samples that may be submitted but not yet presented.
+     * Keeping this small prevents a vendor codec from filling its full-size output pool.
+     */
+    var maxHardwareFramesAhead = 2
+        set(value) {
+            field = value.coerceIn(1, 3)
+        }
 
     val configManager = AnimConfigManager(this)
     val pluginManager = AnimPluginManager(this)
@@ -177,6 +188,7 @@ class AnimPlayer(val animView: IAnimView) {
             if (config != null && (config.isDefaultConfig || animListener?.onVideoConfigReady(config) == true)) {
                 // 播放只用已经解析好的字段和帧对象，原始 JSON 不再留着。
                 config.jsonConfig = null
+                logMemoryBudget("config-ready")
                 innerStartPlay(fileContainer)
             } else {
                 ALog.i(TAG, "onVideoConfigReady return false")
@@ -202,8 +214,25 @@ class AnimPlayer(val animView: IAnimView) {
     }
 
     fun stopPlay() {
+        logMemoryBudget("stop-request")
         decoder?.stop()
         audioPlayer?.stop()
+    }
+
+    fun logMemoryBudget(stage: String) {
+        val config = configManager.config
+        val mix = pluginManager.getMixAnimPlugin()?.memorySnapshot()
+        ALog.i(
+            TAG,
+            "memory[$stage] decoder=${decoder?.javaClass?.simpleName ?: "none"} " +
+                "video=${config?.videoWidth ?: 0}x${config?.videoHeight ?: 0} " +
+                "output=${outputSurfaceWidth}x$outputSurfaceHeight " +
+                "lowMemory=$lowMemoryMode/${lowMemoryMaxVideoPixels}px " +
+                "hardAhead=$maxHardwareFramesAhead " +
+                "mix=${mix?.residentCount ?: 0}src/" +
+                "${mix?.bitmapBytes ?: 0}B-cpu/${mix?.textureEstimateBytes ?: 0}B-gpu/" +
+                "${mix?.pendingEstimateBytes ?: 0}B-pending"
+        )
     }
 
     fun isRunning(): Boolean {
@@ -247,9 +276,17 @@ class AnimPlayer(val animView: IAnimView) {
         if (isDegrading) return
         if (errorType != Constant.REPORT_ERROR_TYPE_DECODE_EXC) return
 
-        isDegrading = true
-        ALog.i(TAG, "Hard decode failed, switching to SoftDecoder: $errorMsg")
+        switchToSoftDecoder("Hard decode failed: $errorMsg")
+    }
 
+    fun switchToLowMemoryDecoder() {
+        if (isDegrading || decoder !is HardDecoder) return
+        switchToSoftDecoder("low memory mode")
+    }
+
+    private fun switchToSoftDecoder(reason: String) {
+        isDegrading = true
+        ALog.i(TAG, "$reason, switching to SoftDecoder")
         val oldDecoder = decoder
         oldDecoder?.stop()
 

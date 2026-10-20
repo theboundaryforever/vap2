@@ -1,6 +1,9 @@
 #include <jni.h>
+#include <android/log.h>
 #include <cstdio>
 #include <cstring>
+
+#define VAP_FFMPEG_LOG_TAG "AnimPlayer.FFmpeg"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -16,23 +19,30 @@ void apply_decode_threads(AVCodecContext *codec_context, int threads) {
     if (codec_context == nullptr) {
         return;
     }
-    // 帧线程会按线程数额外保留解码帧。单线程时关掉帧线程和重排缓冲，少留参考帧。
+    // 帧线程会按线程数额外保留解码帧。单线程时关掉帧线程。
+    // 不能设置 LOW_DELAY：带 B 帧的素材需要解码器重排，强制低延迟会让部分流一帧都不输出。
     if (threads <= 1) {
         codec_context->thread_count = 1;
         codec_context->thread_type = 0;
-        codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
         return;
     }
     codec_context->thread_count = threads;
     codec_context->thread_type = FF_THREAD_FRAME;
 }
 
+void prepare_decoder(AVCodecContext *codec_context, int threads, int lowres) {
+    apply_decode_threads(codec_context, threads);
+    codec_context->skip_loop_filter = AVDISCARD_ALL;
+    codec_context->flags2 |= AV_CODEC_FLAG2_FAST;
+    codec_context->lowres = lowres;
+}
+
 bool open_input_limited(AVFormatContext **format_context, const char *path) {
     AVDictionary *options = nullptr;
     // 默认探测会按约 5MB 预读。mp4 的封装头很小，把探测缓冲收短。
+    // 不能使用 nobuffer：探测阶段读到的首个关键帧会被丢弃，后续 P 帧将无法解码。
     av_dict_set(&options, "probesize", "65536", 0);
     av_dict_set(&options, "analyzeduration", "0", 0);
-    av_dict_set(&options, "fflags", "nobuffer", 0);
     int opened = avformat_open_input(format_context, path, nullptr, &options);
     av_dict_free(&options);
     if (opened < 0) {
@@ -45,7 +55,6 @@ bool open_input_limited(AVFormatContext **format_context, const char *path) {
         }
     }
     if (*format_context != nullptr) {
-        (*format_context)->flags |= AVFMT_FLAG_NOBUFFER;
         (*format_context)->probesize = 64 * 1024;
         (*format_context)->max_analyze_duration = 0;
     }
@@ -123,6 +132,99 @@ bool frame_matches_output(const AVFrame *frame, int output_width, int output_hei
            frame->height == output_height;
 }
 
+// 只有解码器声明支持 lowres 时，参考帧才会按缩小后的尺寸分配。
+// 当前这套 FFmpeg 的 H.264 解码器 max_lowres 为 0，这里会保持 0，参考帧仍是原尺寸。
+int select_lowres(const AVCodec *codec, int src_width, int src_height, int dst_width, int dst_height) {
+    if (codec == nullptr || codec->max_lowres == 0 || src_width <= 0 || src_height <= 0 ||
+        dst_width <= 0 || dst_height <= 0) {
+        return 0;
+    }
+    int lowres = 0;
+    while (lowres < codec->max_lowres) {
+        const int next_w = src_width >> (lowres + 1);
+        const int next_h = src_height >> (lowres + 1);
+        if (next_w < 2 || next_h < 2 || next_w < dst_width || next_h < dst_height) {
+            break;
+        }
+        ++lowres;
+    }
+    return lowres;
+}
+
+struct FrameScale {
+    SwsContext *context;
+    int src_width;
+    int src_height;
+    int src_format;
+};
+
+void frame_scale_reset(FrameScale *scale) {
+    if (scale == nullptr) {
+        return;
+    }
+    scale->context = nullptr;
+    scale->src_width = 0;
+    scale->src_height = 0;
+    scale->src_format = AV_PIX_FMT_NONE;
+}
+
+void frame_scale_free(FrameScale *scale) {
+    if (scale == nullptr || scale->context == nullptr) {
+        return;
+    }
+    sws_freeContext(scale->context);
+    scale->context = nullptr;
+}
+
+bool scale_to_output(
+        FrameScale *scale,
+        const AVFrame *frame,
+        AVFrame *yuv_frame,
+        int output_width,
+        int output_height,
+        const AVFrame **output_frame) {
+    if (frame_matches_output(frame, output_width, output_height)) {
+        *output_frame = frame;
+        return true;
+    }
+    if (scale->context == nullptr ||
+        scale->src_width != frame->width ||
+        scale->src_height != frame->height ||
+        scale->src_format != frame->format) {
+        frame_scale_free(scale);
+        scale->context = sws_getContext(
+                frame->width,
+                frame->height,
+                static_cast<AVPixelFormat>(frame->format),
+                output_width,
+                output_height,
+                AV_PIX_FMT_YUV420P,
+                SWS_FAST_BILINEAR,
+                nullptr,
+                nullptr,
+                nullptr);
+        if (scale->context == nullptr) {
+            return false;
+        }
+        scale->src_width = frame->width;
+        scale->src_height = frame->height;
+        scale->src_format = frame->format;
+    }
+    if (!ensure_yuv_buffer(yuv_frame)) {
+        return false;
+    }
+    sws_scale(
+            scale->context,
+            frame->data,
+            frame->linesize,
+            0,
+            frame->height,
+            yuv_frame->data,
+            yuv_frame->linesize);
+    *output_frame = yuv_frame;
+    return true;
+}
+
 bool convert_and_write_yuv420p(
         FILE *output,
         SwsContext *sws_context,
@@ -155,30 +257,18 @@ bool deliver_yuv420p_frame(
         jmethodID acquire_method,
         jmethodID on_frame_method,
         jmethodID release_method,
-        SwsContext *sws_context,
+        FrameScale *scale,
         const AVFrame *frame,
         AVFrame *yuv_frame,
-        int input_height,
         int output_width,
         int output_height) {
     if (callback == nullptr || acquire_method == nullptr || on_frame_method == nullptr) {
         return false;
     }
 
-    const AVFrame *output_frame = frame;
-    if (!frame_matches_output(frame, output_width, output_height)) {
-        if (sws_context == nullptr || !ensure_yuv_buffer(yuv_frame)) {
-            return false;
-        }
-        sws_scale(
-                sws_context,
-                frame->data,
-                frame->linesize,
-                0,
-                input_height,
-                yuv_frame->data,
-                yuv_frame->linesize);
-        output_frame = yuv_frame;
+    const AVFrame *output_frame = nullptr;
+    if (!scale_to_output(scale, frame, yuv_frame, output_width, output_height, &output_frame)) {
+        return false;
     }
 
     const int frame_size = output_frame->width * output_frame->height * 3 / 2;
@@ -280,6 +370,10 @@ int decode_to_raw_video(
 
     if (avcodec_open2(codec_context, codec, nullptr) < 0) {
         goto cleanup;
+    }
+    if (avformat_seek_file(format_context, video_stream_index, INT64_MIN, 0, INT64_MAX,
+                           AVSEEK_FLAG_BACKWARD) >= 0) {
+        avcodec_flush_buffers(codec_context);
     }
 
     if (output_width <= 0) {
@@ -412,10 +506,9 @@ int decode_to_frames(
     AVPacket *packet = nullptr;
     AVFrame *frame = nullptr;
     AVFrame *yuv_frame = nullptr;
-    SwsContext *sws_context = nullptr;
+    FrameScale scale = {};
     int video_stream_index = -1;
     int result = 1;
-    bool need_convert = false;
     jmethodID is_cancelled_method = nullptr;
     jmethodID acquire_method = nullptr;
     jmethodID on_frame_method = nullptr;
@@ -465,17 +558,50 @@ int decode_to_frames(
     if (avcodec_parameters_to_context(codec_context, format_context->streams[video_stream_index]->codecpar) < 0) {
         goto cleanup;
     }
-    apply_decode_threads(codec_context, threads);
-    codec_context->skip_loop_filter = AVDISCARD_ALL;
-    codec_context->flags2 |= AV_CODEC_FLAG2_FAST;
-    if (avcodec_open2(codec_context, codec, nullptr) < 0) {
-        goto cleanup;
-    }
     if (output_width <= 0) {
         output_width = codec_context->width;
     }
     if (output_height <= 0) {
         output_height = codec_context->height;
+    }
+    {
+        const int coded_width = codec_context->width;
+        const int coded_height = codec_context->height;
+        int lowres = select_lowres(codec, coded_width, coded_height, output_width, output_height);
+        prepare_decoder(codec_context, threads, lowres);
+        bool opened = avcodec_open2(codec_context, codec, nullptr) == 0;
+        if (!opened && lowres > 0) {
+            avcodec_free_context(&codec_context);
+            codec_context = avcodec_alloc_context3(codec);
+            if (codec_context == nullptr ||
+                avcodec_parameters_to_context(
+                        codec_context,
+                        format_context->streams[video_stream_index]->codecpar) < 0) {
+                goto cleanup;
+            }
+            lowres = 0;
+            prepare_decoder(codec_context, threads, lowres);
+            opened = avcodec_open2(codec_context, codec, nullptr) == 0;
+        }
+        if (!opened) {
+            goto cleanup;
+        }
+        if (lowres > 0) {
+            __android_log_print(
+                    ANDROID_LOG_INFO,
+                    VAP_FFMPEG_LOG_TAG,
+                    "lowres=%d coded=%dx%d output=%dx%d",
+                    lowres,
+                    coded_width,
+                    coded_height,
+                    output_width,
+                    output_height);
+        }
+    }
+    // find_stream_info 可能已经读过首包；回到流开头，确保唯一的 IDR 不被探测阶段吞掉。
+    if (avformat_seek_file(format_context, video_stream_index, INT64_MIN, 0, INT64_MAX,
+                           AVSEEK_FLAG_BACKWARD) >= 0) {
+        avcodec_flush_buffers(codec_context);
     }
 
     packet = av_packet_alloc();
@@ -487,26 +613,6 @@ int decode_to_frames(
     yuv_frame->format = AV_PIX_FMT_YUV420P;
     yuv_frame->width = output_width;
     yuv_frame->height = output_height;
-    need_convert =
-            codec_context->pix_fmt != AV_PIX_FMT_YUV420P ||
-            codec_context->width != output_width ||
-            codec_context->height != output_height;
-    if (need_convert) {
-        sws_context = sws_getContext(
-                codec_context->width,
-                codec_context->height,
-                codec_context->pix_fmt,
-                output_width,
-                output_height,
-                AV_PIX_FMT_YUV420P,
-                SWS_FAST_BILINEAR,
-                nullptr,
-                nullptr,
-                nullptr);
-        if (sws_context == nullptr) {
-            goto cleanup;
-        }
-    }
 
     while (!is_cancelled(env, session, is_cancelled_method) && av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == video_stream_index && avcodec_send_packet(codec_context, packet) == 0) {
@@ -524,10 +630,9 @@ int decode_to_frames(
                         acquire_method,
                         on_frame_method,
                         release_method,
-                        sws_context,
+                        &scale,
                         frame,
                         yuv_frame,
-                        codec_context->height,
                         output_width,
                         output_height)) {
                     result = is_cancelled(env, session, is_cancelled_method) ? 255 : 0;
@@ -554,10 +659,9 @@ int decode_to_frames(
                 acquire_method,
                 on_frame_method,
                 release_method,
-                sws_context,
+                &scale,
                 frame,
                 yuv_frame,
-                codec_context->height,
                 output_width,
                 output_height)) {
             result = is_cancelled(env, session, is_cancelled_method) ? 255 : 0;
@@ -568,9 +672,7 @@ int decode_to_frames(
     result = is_cancelled(env, session, is_cancelled_method) ? 255 : 0;
 
 cleanup:
-    if (sws_context != nullptr) {
-        sws_freeContext(sws_context);
-    }
+    frame_scale_free(&scale);
     if (yuv_frame != nullptr) {
         av_frame_free(&yuv_frame);
     }

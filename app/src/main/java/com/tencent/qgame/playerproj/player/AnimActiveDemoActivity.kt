@@ -84,6 +84,7 @@ class AnimActiveDemoActivity : Activity(), IAnimListener {
         initTestView()
         // 获取动画view
         animView = binding.playerView
+        animView.setLowMemoryMode(true)
         // 铺满屏幕。FIT_CENTER 会按 750:1624 缩小宽度，左右留空。
         animView.setScaleType(ScaleType.FIT_XY)
         // 注册动画监听

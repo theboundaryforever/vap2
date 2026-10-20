@@ -78,6 +78,8 @@ class AnimSimpleDemoActivity : Activity(), IAnimListener {
         initTestView()
         // 获取动画view
         animView =  binding.playerView
+        // 大尺寸素材优先按像素预算缩放软解，减少硬解输出池常驻内存。
+        animView.setLowMemoryMode(true, 500_000)
         // 居中（根据父布局按比例居中并全部显示，默认fitXY）
         animView.setScaleType(ScaleType.FIT_CENTER)
         // 注册动画监听

@@ -52,6 +52,10 @@ interface IAnimView {
 
     fun setMute(isMute: Boolean)
 
+    fun setLowMemoryMode(enable: Boolean)
+
+    fun setLowMemoryMode(enable: Boolean, maxVideoPixels: Int)
+
     fun startPlay(file: File)
 
     fun startPlay(assetManager: AssetManager, assetsPath: String)

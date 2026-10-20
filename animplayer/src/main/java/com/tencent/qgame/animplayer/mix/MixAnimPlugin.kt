@@ -36,7 +36,10 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         private const val SYNC_FRAMES = 1
         // 本地图提前约一秒，网络图再早一点。窗口之外的不进内存。
         private const val LOCAL_AHEAD = 15
-        private const val NET_AHEAD = 45
+        private const val NET_AHEAD = 20
+        // 图片在 Java Bitmap 和 GL texture 上传期间会短暂同时存在。控制预取预算，
+        // 不让网络资源数量随着动画帧数无限放大。
+        private const val PREFETCH_BUDGET_BYTES = 8 * 1024 * 1024
     }
     var resourceRequest: IFetchResource? = null
     var resourceClickListener: OnResourceClickListener? = null
@@ -56,6 +59,8 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
     private val scaledBitmaps = HashSet<Bitmap>()
     // 每次请求一个票据。素材被换出窗口后旧回调不能再把图放回来。
     private val tickets = HashMap<String, Int>()
+    private val pendingEstimateBytes = HashMap<String, Long>()
+    private val textureEstimateBytes = HashMap<String, Long>()
     private var nextTicket = 1
     private var residentIds = emptySet<String>()
 
@@ -104,7 +109,9 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         synchronized(lock) {
             forceStopLock = false
             tickets.clear()
+            pendingEstimateBytes.clear()
         }
+        textureEstimateBytes.clear()
         residentIds = emptySet()
         // 只等开头几帧要用的素材。其余的等播放走到附近再取。
         val immediate = sourcesUsed(0, SYNC_FRAMES)
@@ -124,6 +131,7 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
             }
         }
         residentIds = upcoming.map { it.srcId }.toSet()
+        player.logMemoryBudget("mix-config-ready")
         return Constant.OK
     }
 
@@ -201,7 +209,12 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         frames?.close()
         frames = null
         residentIds = emptySet()
-        synchronized(lock) { tickets.clear() }
+        synchronized(lock) {
+            tickets.clear()
+            pendingEstimateBytes.clear()
+        }
+        textureEstimateBytes.clear()
+        player.logMemoryBudget("mix-release")
     }
 
     private fun parseSrc(config: AnimConfig) {
@@ -217,6 +230,7 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         frames?.close()
         frames = null
         residentIds = emptySet()
+        textureEstimateBytes.clear()
     }
 
     private fun parseFrame(config: AnimConfig) {
@@ -239,6 +253,7 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         val total = player.configManager.config?.totalFrames ?: 0
         val looping = player.playLoop > 1 && total > 0
         val result = ArrayList<Src>()
+        var reserved = currentResourceBytes()
         for (src in map.values) {
             if (src.srcType != Src.SrcType.IMG && src.srcType != Src.SrcType.TXT) continue
             val ahead = if (src.loadType == Src.LoadType.NET) NET_AHEAD else LOCAL_AHEAD
@@ -247,7 +262,16 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
             if (!hit && looping && end >= total) {
                 hit = frames?.isUsedBetween(src.srcId, 0, end - total) == true
             }
-            if (hit) result.add(src)
+            if (!hit) continue
+            val estimate = estimateBytes(src)
+            val alreadyResident = src.srcTextureId != 0 || src.bitmap?.isRecycled == false ||
+                synchronized(lock) { tickets.containsKey(src.srcId) }
+            if (alreadyResident || reserved + estimate <= PREFETCH_BUDGET_BYTES) {
+                result.add(src)
+                if (!alreadyResident) reserved += estimate
+            } else {
+                ALog.i(TAG, "skip prefetch ${src.srcId}: budget=$reserved/$PREFETCH_BUDGET_BYTES")
+            }
         }
         return result
     }
@@ -286,7 +310,11 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
                 mixRender?.release(src.srcTextureId)
                 src.srcTextureId = 0
             }
-            synchronized(lock) { tickets.remove(src.srcId) }
+            synchronized(lock) {
+                tickets.remove(src.srcId)
+                pendingEstimateBytes.remove(src.srcId)
+            }
+            textureEstimateBytes.remove(src.srcId)
             val handed = releaseHeldBitmap(src)
             if (handed != null) resourceRequest?.releaseResource(listOf(handed))
             if (hadTexture || hadBitmap) {
@@ -308,8 +336,10 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         val (outputW, outputH) = SrcBitmapScaler.outputSize(player)
         val (slotW, slotH) = maxSlot(src)
         val (targetW, targetH) = SrcBitmapScaler.targetSize(src, config, outputW, outputH, slotW, slotH)
+        val estimate = estimatedRgbaBytes(targetW, targetH)
         try {
             if (src.srcType == Src.SrcType.IMG) {
+                synchronized(lock) { pendingEstimateBytes[src.srcId] = estimate }
                 ALog.i(TAG, "fetch image ${src.srcId} target=${targetW}x$targetH")
                 val resource = Resource(src).apply {
                     targetWidth = targetW
@@ -319,6 +349,7 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
                     onImage(src, ticket, bitmap, targetW, targetH)
                 } ?: abandon(src.srcId, ticket)
             } else if (src.srcType == Src.SrcType.TXT) {
+                synchronized(lock) { pendingEstimateBytes[src.srcId] = estimate }
                 ALog.i(TAG, "fetch txt ${src.srcId}")
                 resourceRequest?.fetchText(Resource(src)) { text ->
                     onText(src, ticket, text)
@@ -390,6 +421,7 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         synchronized(lock) {
             if (tickets[src.srcId] != ticket) return false
             tickets.remove(src.srcId)
+            pendingEstimateBytes.remove(src.srcId)
             src.bitmap = bitmap
             lock.notifyAll()
             return true
@@ -398,7 +430,10 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
 
     private fun abandon(srcId: String, ticket: Int) {
         synchronized(lock) {
-            if (tickets[srcId] == ticket) tickets.remove(srcId)
+            if (tickets[srcId] == ticket) {
+                tickets.remove(srcId)
+                pendingEstimateBytes.remove(srcId)
+            }
             lock.notifyAll()
         }
     }
@@ -407,6 +442,7 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
         synchronized(lock) {
             forceStopLock = true
             tickets.clear()
+            pendingEstimateBytes.clear()
             lock.notifyAll()
         }
     }
@@ -458,6 +494,42 @@ class MixAnimPlugin(val player: AnimPlayer): IAnimPlugin {
             render.upload(src)
         }
     }
+
+    fun onTextureUploaded(src: Src, width: Int, height: Int) {
+        textureEstimateBytes[src.srcId] = estimatedRgbaBytes(width, height)
+    }
+
+    data class MemorySnapshot(
+        val residentCount: Int,
+        val bitmapBytes: Long,
+        val textureEstimateBytes: Long,
+        val pendingEstimateBytes: Long
+    )
+
+    fun memorySnapshot(): MemorySnapshot {
+        val bitmaps = srcMap?.map?.values?.sumOf {
+            val bitmap = it.bitmap
+            if (bitmap != null && !bitmap.isRecycled) bitmap.allocationByteCount.toLong() else 0L
+        } ?: 0L
+        val pending = synchronized(lock) { pendingEstimateBytes.values.sum() }
+        return MemorySnapshot(residentIds.size, bitmaps, textureEstimateBytes.values.sum(), pending)
+    }
+
+    private fun currentResourceBytes(): Long {
+        val snapshot = memorySnapshot()
+        return snapshot.bitmapBytes + snapshot.textureEstimateBytes + snapshot.pendingEstimateBytes
+    }
+
+    private fun estimateBytes(src: Src): Long {
+        val config = player.configManager.config
+        val (outputW, outputH) = SrcBitmapScaler.outputSize(player)
+        val (slotW, slotH) = maxSlot(src)
+        val (targetW, targetH) = SrcBitmapScaler.targetSize(src, config, outputW, outputH, slotW, slotH)
+        return estimatedRgbaBytes(targetW, targetH)
+    }
+
+    private fun estimatedRgbaBytes(width: Int, height: Int): Long =
+        width.toLong().coerceAtLeast(1) * height.toLong().coerceAtLeast(1) * 4L
 
     private fun dropBitmap(src: Src, bitmap: Bitmap?) {
         val handed = discardBitmap(src, bitmap) ?: return
