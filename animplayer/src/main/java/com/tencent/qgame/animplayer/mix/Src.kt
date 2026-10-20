@@ -19,6 +19,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import com.tencent.qgame.animplayer.Constant
 import com.tencent.qgame.animplayer.util.ALog
+import org.json.JSONArray
 import org.json.JSONObject
 
 class Src {
@@ -64,7 +65,9 @@ class Src {
     var bitmap: Bitmap? = null
         set(value) {
             field = value
-            genDrawSize(value)
+            if (value != null) {
+                genDrawSize(value)
+            }
         }
 
     constructor(json: JSONObject) {
@@ -135,14 +138,15 @@ class Src {
 }
 
 
-class SrcMap(json: JSONObject) {
+class SrcMap {
     val map = HashMap<String, Src>()
 
-    init {
-        val srcJsonArray = json.getJSONArray("src")
-        val srcLen = srcJsonArray?.length() ?: 0
+    constructor(json: JSONObject) : this(json.getJSONArray("src"))
+
+    constructor(srcJsonArray: JSONArray) {
+        val srcLen = srcJsonArray.length()
         for (i in 0 until srcLen) {
-            val srcJson = srcJsonArray?.getJSONObject(i) ?: continue
+            val srcJson = srcJsonArray.optJSONObject(i) ?: continue
             val src = Src(srcJson)
             if (src.srcType != Src.SrcType.UNKNOWN) { // 不认识的srcType丢弃
                 map[src.srcId] = src

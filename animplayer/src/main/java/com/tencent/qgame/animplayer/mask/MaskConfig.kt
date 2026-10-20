@@ -54,6 +54,10 @@ class MaskConfig() {
     
 
     fun release() {
+        if (maskTexId > 0) {
+            TextureLoadUtil.releaseTexure(maskTexId)
+            maskTexId = 0
+        }
         alphaMaskBitmap = null
         maskTexPair = null
         maskPositionPair = null

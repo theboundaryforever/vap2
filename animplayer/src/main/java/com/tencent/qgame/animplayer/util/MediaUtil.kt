@@ -33,7 +33,6 @@ object MediaUtil {
 
     // mime+尺寸 -> 硬解是否支持（只缓存成功查询的结果）
     private val sizeSupportCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
-    private val lowLatencyCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     // 解码器列表在进程内不变，只构造一次
     private val regularCodecInfos: Array<android.media.MediaCodecInfo> by lazy {
@@ -145,21 +144,6 @@ object MediaUtil {
             ALog.e(TAG, "findHardwareDecoderName $t", t)
             null
         }
-    }
-
-    fun supportsLowLatency(codecName: String, mimeType: String): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || codecName.isEmpty() || mimeType.isEmpty()) {
-            return false
-        }
-        val cacheKey = "$codecName|$mimeType"
-        lowLatencyCache[cacheKey]?.let { return it }
-        val supported = runCatching {
-            regularCodecInfos.firstOrNull { it.name == codecName }
-                ?.getCapabilitiesForType(mimeType)
-                ?.isFeatureSupported(android.media.MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency) == true
-        }.getOrDefault(false)
-        lowLatencyCache[cacheKey] = supported
-        return supported
     }
 
     private fun isSoftwareCodec(info: android.media.MediaCodecInfo): Boolean {

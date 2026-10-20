@@ -6,6 +6,7 @@ import com.arthenica.ffmpegkit.FFprobeKit
 import com.arthenica.ffmpegkit.LiteFFmpegFrameCallback
 import com.tencent.qgame.animplayer.file.IFileContainer
 import com.tencent.qgame.animplayer.util.ALog
+import com.tencent.qgame.animplayer.util.PlaybackSize
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
@@ -17,8 +18,8 @@ class SoftDecoder(player: AnimPlayer) : Decoder(player) {
     companion object {
         private const val TAG = "${Constant.TAG}.SoftDecoder"
         private const val RENDER_TIMEOUT_SEC = 5L
-        // 一块给解码写入，一块给渲染读取。再多一块就是一整帧 YUV 常驻，软解本身已经是降级路径。
-        private const val BUFFERED_FRAME_COUNT = 2
+        // 只留一块 YUV。渲染还没把这块交还之前，解码在原地等，不再同时留两帧。
+        private const val BUFFERED_FRAME_COUNT = 1
 
         // 对应电脑端电脑压缩素材设定的帧率（例如 10 帧或 12 帧）
         // 如果你电脑端脚本改成了 12，这里也请同步改成 12
@@ -100,8 +101,19 @@ class SoftDecoder(player: AnimPlayer) : Decoder(player) {
             finishWithError(Constant.REPORT_ERROR_TYPE_CREATE_RENDER, "preparePlay failed")
             return
         }
+        val (decodeWidth, decodeHeight) = PlaybackSize.scaledVideoSize(
+            videoWidth,
+            videoHeight,
+            config?.width ?: 0,
+            config?.height ?: 0,
+            player.outputSurfaceWidth,
+            player.outputSurfaceHeight
+        )
+        if (decodeWidth != videoWidth || decodeHeight != videoHeight) {
+            ALog.i(TAG, "scale decode ${videoWidth}x$videoHeight -> ${decodeWidth}x$decodeHeight")
+        }
         running = true
-        decodeYuvAndRender(videoPath, videoWidth, videoHeight)
+        decodeYuvAndRender(videoPath, decodeWidth, decodeHeight)
     }
 
     private fun decodeYuvAndRender(videoPath: String, width: Int, height: Int) {
@@ -260,9 +272,11 @@ class SoftDecoder(player: AnimPlayer) : Decoder(player) {
         val latch = CountDownLatch(1)
         renderThread.handler?.post {
             try {
+                // 先删融合图和遮罩纹理，再销毁 EGL。上下文没了之后 glDeleteTextures 不起作用。
+                (render as? YUVRender)?.bindGlContext()
+                player.pluginManager.onRelease()
                 render?.destroyRender()
                 render = null
-                player.pluginManager.onRelease()
             } catch (e: Exception) {
                 ALog.e(TAG, "releaseRender error", e)
             } finally {

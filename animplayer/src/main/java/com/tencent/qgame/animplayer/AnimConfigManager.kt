@@ -17,6 +17,8 @@ package com.tencent.qgame.animplayer
 
 import android.os.SystemClock
 import com.tencent.qgame.animplayer.file.IFileContainer
+import com.tencent.qgame.animplayer.mix.FrameSource
+import com.tencent.qgame.animplayer.mix.SrcMap
 import com.tencent.qgame.animplayer.util.ALog
 import com.tencent.qgame.animplayer.util.MediaUtil
 import org.json.JSONObject
@@ -33,6 +35,7 @@ class AnimConfigManager(val player: AnimPlayer) {
         private const val TAG = "${Constant.TAG}.AnimConfigManager"
         private const val MAX_VAPC_PAYLOAD_SIZE = 1024 * 1024
         private const val TAIL_SEARCH_SIZE = 1024 * 1024L
+        private const val TAIL_CHUNK_SIZE = 64 * 1024
     }
 
     var config: AnimConfig? = null
@@ -65,6 +68,7 @@ class AnimConfigManager(val player: AnimPlayer) {
             return resultCode
         } catch (e : Throwable) {
             ALog.e(TAG, "parseConfig error $e", e)
+            config?.jsonConfig = null
             isParsingConfig = false
             return Constant.REPORT_ERROR_TYPE_PARSE_CONFIG
         }
@@ -125,10 +129,10 @@ class AnimConfigManager(val player: AnimPlayer) {
 
         try {
             fileContainer.startRandomRead()
-            val vapcBuf = findVapcPayload(fileContainer)
-            if (vapcBuf != null) {
+            val located = findVapcPayload(fileContainer)
+            if (located != null) {
                 val parsed = runCatching {
-                    parseVapcConfig(config, vapcBuf, defaultFps)
+                    parseVapcConfig(config, located.bytes, located.offset, fileContainer, defaultFps)
                 }.getOrElse {
                     ALog.e(TAG, "vapc parse failed $it", it)
                     false
@@ -146,14 +150,21 @@ class AnimConfigManager(val player: AnimPlayer) {
         }
     }
 
-    private fun findVapcPayload(fileContainer: IFileContainer): ByteArray? {
+    private class LocatedVapc(val bytes: ByteArray, val offset: Long)
+
+    private fun findVapcPayload(fileContainer: IFileContainer): LocatedVapc? {
+        var position = 0L
         while (true) {
             val initial = ByteArray(8)
             if (fileContainer.read(initial, 0, initial.size) != 8) break
+            position += 8
 
-            val box = parseBoxHeader(fileContainer, initial) ?: break
+            val header = parseBoxHeader(fileContainer, initial) ?: break
+            position += header.extraRead
+            val box = header.box
             if ("vapc" == box.type) {
-                return readBoxPayload(fileContainer, box)
+                val payload = readBoxPayload(fileContainer, box) ?: return null
+                return LocatedVapc(payload, position)
             }
 
             if (box.size == 0L) {
@@ -168,6 +179,7 @@ class AnimConfigManager(val player: AnimPlayer) {
             val payloadSize = box.payloadSize
             if (payloadSize > 0) {
                 fileContainer.skip(payloadSize)
+                position += payloadSize
             }
         }
 
@@ -209,22 +221,26 @@ class AnimConfigManager(val player: AnimPlayer) {
         val payloadSize: Long get() = size - headerSize
     }
 
-    private fun parseBoxHeader(fileContainer: IFileContainer, initial8: ByteArray): Mp4Box? {
+    private class ParsedHeader(val box: Mp4Box, val extraRead: Int)
+
+    private fun parseBoxHeader(fileContainer: IFileContainer, initial8: ByteArray): ParsedHeader? {
         val type = String(initial8, 4, 4, Charset.forName("US-ASCII"))
         var size = readUInt32BE(initial8, 0).toLong()
         var headerSize = 8
+        var extraRead = 0
 
         if (size == 1L) {
             val ext = ByteArray(8)
             if (fileContainer.read(ext, 0, ext.size) != ext.size) return null
             size = readUInt64BE(ext, 0)
             headerSize = 16
+            extraRead = 8
         } else if (size == 0L) {
-            return Mp4Box(type, 0, headerSize)
+            return ParsedHeader(Mp4Box(type, 0, headerSize), extraRead)
         }
 
         if (size < headerSize) return null
-        return Mp4Box(type, size, headerSize)
+        return ParsedHeader(Mp4Box(type, size, headerSize), extraRead)
     }
 
     private fun readBoxPayload(fileContainer: IFileContainer, box: Mp4Box): ByteArray? {
@@ -261,8 +277,62 @@ class AnimConfigManager(val player: AnimPlayer) {
         return value
     }
 
-    private fun parseVapcConfig(config: AnimConfig, vapcBuf: ByteArray, defaultFps: Int): Boolean {
-        val json = String(vapcBuf, 0, vapcBuf.size, Charset.forName("UTF-8"))
+    private fun parseVapcConfig(
+        config: AnimConfig,
+        bytes: ByteArray,
+        payloadOffset: Long,
+        fileContainer: IFileContainer,
+        defaultFps: Int
+    ): Boolean {
+        val streamed = try {
+            parseVapcStreaming(config, bytes, payloadOffset, fileContainer, defaultFps)
+        } catch (t: Throwable) {
+            ALog.e(TAG, "stream vapc parse failed, fallback to tree", t)
+            false
+        }
+        if (streamed) return true
+        return parseVapcTree(config, String(bytes, Charset.forName("UTF-8")), defaultFps)
+    }
+
+    /**
+     * 只把 info / src 建成对象。frame 记下载荷内的偏移和每个素材的出现帧，
+     * 播放时再按窗口把要用的帧读出来。
+     */
+    private fun parseVapcStreaming(
+        config: AnimConfig,
+        bytes: ByteArray,
+        payloadOffset: Long,
+        fileContainer: IFileContainer,
+        defaultFps: Int
+    ): Boolean {
+        val indexed = FrameSource.index(bytes, fileContainer, payloadOffset) ?: return false
+        if (!config.parseInfo(indexed.info)) {
+            indexed.frames?.close()
+            return false
+        }
+        if (defaultFps > 0) {
+            config.fps = defaultFps
+        }
+        player.fps = config.fps
+        val src = indexed.src
+        val mixFrames = indexed.frames
+        if (config.isMix && (src == null || mixFrames == null)) {
+            mixFrames?.close()
+            return false
+        }
+        config.jsonConfig = JSONObject().apply {
+            put("info", indexed.info)
+            if (src != null) put("src", src)
+        }
+        if (!config.isMix || src == null || mixFrames == null) {
+            mixFrames?.close()
+            return config.isMix.not()
+        }
+        player.pluginManager.getMixAnimPlugin()?.setStreamData(SrcMap(src), mixFrames)
+        return true
+    }
+
+    private fun parseVapcTree(config: AnimConfig, json: String, defaultFps: Int): Boolean {
         val jsonObj = JSONObject(json)
         config.jsonConfig = jsonObj
         val result = config.parse(jsonObj)
@@ -273,18 +343,18 @@ class AnimConfigManager(val player: AnimPlayer) {
         return result
     }
 
-    private fun findVapcPayloadInTail(fileContainer: IFileContainer): ByteArray? {
+    private fun findVapcPayloadInTail(fileContainer: IFileContainer): LocatedVapc? {
         val fileLength = fileContainer.fileLength()
         if (fileLength > 12) {
-            val tailSize = minOf(TAIL_SEARCH_SIZE, fileLength)
-            if (fileContainer.seekAbsolute(fileLength - tailSize)) {
-                val tail = ByteArray(tailSize.toInt())
-                if (fileContainer.read(tail, 0, tail.size) == tail.size) {
-                    extractVapcPayloadFromTail(tail)?.let { payload ->
-                        ALog.i(TAG, "vapc found from container tail")
-                        return payload
-                    }
+            findVapcInRange(fileLength) { position, dst, len ->
+                if (!fileContainer.seekAbsolute(position)) {
+                    -1
+                } else {
+                    fileContainer.read(dst, 0, len)
                 }
+            }?.let { payload ->
+                ALog.i(TAG, "vapc found from container tail")
+                return payload
             }
         }
 
@@ -294,13 +364,10 @@ class AnimConfigManager(val player: AnimPlayer) {
 
         return try {
             RandomAccessFile(file, "r").use { raf ->
-                val tailSize = minOf(TAIL_SEARCH_SIZE, raf.length()).toInt()
-                if (tailSize < 12) return null
-
-                val tail = ByteArray(tailSize)
-                raf.seek(raf.length() - tailSize)
-                raf.readFully(tail)
-                extractVapcPayloadFromTail(tail)?.also {
+                findVapcInRange(raf.length()) { position, dst, len ->
+                    raf.seek(position)
+                    raf.read(dst, 0, len)
+                }?.also {
                     ALog.i(TAG, "vapc found from file tail")
                 }
             }
@@ -310,37 +377,77 @@ class AnimConfigManager(val player: AnimPlayer) {
         }
     }
 
-    private fun extractVapcPayloadFromTail(tail: ByteArray): ByteArray? {
-        val vapcIndex = tail.lastIndexOfAscii("vapc")
-        if (vapcIndex < 4) return null
-
-        val lengthIndex = vapcIndex - 4
-        val boxLength = readUInt32BE(tail, lengthIndex).toLong()
-        if (boxLength <= 8 || boxLength > MAX_VAPC_PAYLOAD_SIZE + 8) {
-            ALog.e(TAG, "invalid tail vapc length=$boxLength")
-            return null
+    /**
+     * 从文件尾往前按 64KB 找 vapc，只分配真正的配置负载。
+     * 不再把最多 1MB 的尾部整段读进内存。
+     */
+    private fun findVapcInRange(
+        fileLength: Long,
+        readAt: (position: Long, dst: ByteArray, len: Int) -> Int
+    ): LocatedVapc? {
+        if (fileLength <= 12) return null
+        val origin = maxOf(0L, fileLength - TAIL_SEARCH_SIZE)
+        val chunk = ByteArray(TAIL_CHUNK_SIZE)
+        var pos = fileLength
+        while (pos > origin) {
+            val chunkStart = maxOf(origin, pos - chunk.size)
+            val size = (pos - chunkStart).toInt()
+            if (!readFully(chunkStart, chunk, size, readAt)) return null
+            var index = size - 4
+            while (index >= 0) {
+                if (chunk[index] == 'v'.code.toByte() &&
+                    chunk[index + 1] == 'a'.code.toByte() &&
+                    chunk[index + 2] == 'p'.code.toByte() &&
+                    chunk[index + 3] == 'c'.code.toByte()
+                ) {
+                    readVapcPayloadAt(fileLength, chunkStart + index, readAt)?.let { return it }
+                }
+                index--
+            }
+            if (chunkStart == origin) break
+            pos = chunkStart + 3
         }
-        if (lengthIndex + boxLength > tail.size) {
-            ALog.e(TAG, "tail vapc box exceeds search window, length=$boxLength")
-            return null
-        }
-
-        return tail.copyOfRange(vapcIndex + 4, lengthIndex + boxLength.toInt())
+        return null
     }
 
-    private fun ByteArray.lastIndexOfAscii(text: String): Int {
-        val target = text.toByteArray(Charset.forName("US-ASCII"))
-        for (i in size - target.size downTo 0) {
-            var matched = true
-            for (j in target.indices) {
-                if (this[i + j] != target[j]) {
-                    matched = false
-                    break
-                }
-            }
-            if (matched) return i
+    private fun readVapcPayloadAt(
+        fileLength: Long,
+        vapcPosition: Long,
+        readAt: (position: Long, dst: ByteArray, len: Int) -> Int
+    ): LocatedVapc? {
+        val lengthIndex = vapcPosition - 4
+        if (lengthIndex < 0) return null
+        val lengthBytes = ByteArray(4)
+        if (!readFully(lengthIndex, lengthBytes, 4, readAt)) return null
+        val boxLength = readUInt32BE(lengthBytes, 0).toLong()
+        if (boxLength <= 8 || boxLength > MAX_VAPC_PAYLOAD_SIZE + 8) return null
+        if (lengthIndex + boxLength > fileLength) return null
+
+        val payload = ByteArray((boxLength - 8).toInt())
+        if (!readFully(vapcPosition + 4, payload, payload.size, readAt)) return null
+        return LocatedVapc(payload, vapcPosition + 4)
+    }
+
+    /**
+     * readAt 每次都从 dst[0] 写入。分多次读时用一块小缓冲再拷过去，避免后一次覆盖前一次。
+     */
+    private fun readFully(
+        position: Long,
+        dst: ByteArray,
+        len: Int,
+        readAt: (position: Long, dst: ByteArray, len: Int) -> Int
+    ): Boolean {
+        if (len <= 0 || len > dst.size) return false
+        val scratch = ByteArray(minOf(8192, len))
+        var done = 0
+        while (done < len) {
+            val want = minOf(scratch.size, len - done)
+            val read = readAt(position + done, scratch, want)
+            if (read <= 0) return false
+            System.arraycopy(scratch, 0, dst, done, read)
+            done += read
         }
-        return -1
+        return true
     }
 
 }

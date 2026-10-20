@@ -54,7 +54,16 @@ class AnimConfig {
      */
     fun parse(json: JSONObject): Boolean {
         return try {
-            json.getJSONObject("info").apply {
+            parseInfo(json.getJSONObject("info"))
+        } catch (e : JSONException) {
+            ALog.e(TAG, "json parse fail $e", e)
+            false
+        }
+    }
+
+    fun parseInfo(info: JSONObject): Boolean {
+        return try {
+            info.apply {
                 val v = getInt("v")
                 if (version != v) {
                     ALog.e(TAG, "current version=$version target=$v")

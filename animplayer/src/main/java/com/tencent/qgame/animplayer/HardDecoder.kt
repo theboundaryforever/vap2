@@ -20,16 +20,26 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
+import android.os.SystemClock
 import android.view.Surface
 import com.tencent.qgame.animplayer.file.IFileContainer
 import com.tencent.qgame.animplayer.util.ALog
 import com.tencent.qgame.animplayer.util.MediaUtil
 
+/**
+ * 硬解只使用硬件解码器，并且屏幕上一次只留一帧。
+ * 系统软解（c2.android / OMX.google）没有画面上限，不进这条路径；
+ * 没有硬件解码器时直接交给已经限死缓冲的 SoftDecoder。
+ */
 class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameAvailableListener {
 
 
     companion object {
         private const val TAG = "${Constant.TAG}.HardDecoder"
+        private const val PRESENT_WAIT_MS = 800L
+        // 解码比正在显示的画面超前的样本数。再多，解码器就会把输出池里的全尺寸画面填满。
+        private const val MAX_FRAMES_AHEAD = 1
+        private const val MAX_EXTRA_AHEAD = 4
     }
 
     private var surface: Surface? = null
@@ -40,19 +50,29 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
     // 动画的原始尺寸
     private var videoWidth = 0
     private var videoHeight = 0
+    private val presentLock = Object()
+    private var presentPending = false
+
+    // 一次播放只做一次收尾释放。播完、停止、失败、降级几条路径都可能走到 release，
+    // 重复执行会让已释放的 codec 再 stop/release，并重复回调 onVideoComplete。
+    private val releaseLock = Object()
+    private var released = true
 
     override fun start(fileContainer: IFileContainer) {
         isStopReq = false
         needDestroy = false
         isRunning = true
+        synchronized(releaseLock) { released = false }
         renderThread.handler?.post {
             startPlay(fileContainer)
         }
     }
 
     override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
-        if (isStopReq) return
-        if (render == null) return
+        if (isStopReq || render == null) {
+            signalPresented()
+            return
+        }
         val handler = renderThread.handler
         if (handler != null && android.os.Looper.myLooper() == handler.looper) {
             drawAvailableFrame()
@@ -72,13 +92,36 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
             }
         } catch (e: Throwable) {
             ALog.e(TAG, "render exception=$e", e)
+        } finally {
+            signalPresented()
+        }
+    }
+
+    private fun awaitPresented() {
+        val deadline = SystemClock.elapsedRealtime() + PRESENT_WAIT_MS
+        synchronized(presentLock) {
+            while (presentPending && !isStopReq) {
+                val left = deadline - SystemClock.elapsedRealtime()
+                if (left <= 0L) {
+                    presentPending = false
+                    break
+                }
+                presentLock.wait(left)
+            }
+        }
+    }
+
+    private fun signalPresented() {
+        synchronized(presentLock) {
+            presentPending = false
+            presentLock.notifyAll()
         }
     }
 
     private fun startPlay(fileContainer: IFileContainer) {
 
         var extractor: MediaExtractor? = null
-        var decoder: MediaCodec? = null
+        var decoder: CodecIo? = null
         var format: MediaFormat? = null
         var trackIndex = 0
 
@@ -108,7 +151,18 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
 
             videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
             videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
             ALog.i(TAG, "Video size is $videoWidth x $videoHeight")
+            if (MediaUtil.findHardwareDecoderName(mime, videoWidth, videoHeight).isNullOrEmpty()) {
+                ALog.i(TAG, "no hardware decoder for $mime, use budgeted soft path")
+                try {
+                    extractor.release()
+                } catch (t: Throwable) {
+                    ALog.e(TAG, "release extractor", t)
+                }
+                onFailed(Constant.REPORT_ERROR_TYPE_DECODE_EXC, "no hardware decoder")
+                return
+            }
 
             try {
                 if (!prepareRender(false)) {
@@ -164,13 +218,15 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         }
     }
 
-    private fun startDecode(extractor: MediaExtractor ,decoder: MediaCodec) {
+    private fun startDecode(extractor: MediaExtractor, decoder: CodecIo) {
         val TIMEOUT_USEC = 10000L
         var inputChunk = 0
         var outputDone = false
         var inputDone = false
         var frameIndex = 0
         var isLoop = false
+        var framesAhead = 0
+        var extraAhead = 0
 
         while (!outputDone) {
             if (isStopReq) {
@@ -179,28 +235,20 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                 return
             }
 
-            // 尽可能把解码器的输入缓冲一次喂满，而不是每轮只喂一帧：
-            // 解码器有 B 帧重排/流水线深度，逐帧喂会让首帧以及每次循环重启后的首帧多等若干个超时周期。
-            // 输入侧不阻塞（仅解码器刚 start 时等一次），阻塞等待统一放在下面的 dequeueOutputBuffer。
-            while (!inputDone) {
-                val inputBufIndex = decoder.dequeueInputBuffer(if (inputChunk == 0) TIMEOUT_USEC else 0L)
+            val aheadLimit = MAX_FRAMES_AHEAD + extraAhead
+            while (!inputDone && framesAhead < aheadLimit) {
+                val inputBufIndex = decoder.dequeueInput(if (inputChunk == 0) TIMEOUT_USEC else 0L)
                 if (inputBufIndex < 0) {
                     if (ALog.isDebug) ALog.d(TAG, "input buffer not available")
                     break
                 }
-                val inputBuf = decoder.getInputBuffer(inputBufIndex)
-                if (inputBuf == null) {
-                    decoder.queueInputBuffer(inputBufIndex, 0, 0, 0L, 0)
-                    break
-                }
-                val chunkSize = extractor.readSampleData(inputBuf, 0)
+                val chunkSize = decoder.queueSample(inputBufIndex, extractor)
+                if (chunkSize == 0) break
                 if (chunkSize < 0) {
-                    decoder.queueInputBuffer(inputBufIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     inputDone = true
                     ALog.d(TAG, "decode EOS")
                 } else {
-                    val presentationTimeUs = extractor.sampleTime
-                    decoder.queueInputBuffer(inputBufIndex, 0, chunkSize, presentationTimeUs, 0)
+                    framesAhead++
                     if (ALog.isDebug) {
                         ALog.d(TAG, "submitted frame $inputChunk to dec, size=$chunkSize")
                     }
@@ -208,21 +256,27 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                     extractor.advance()
                 }
             }
+            val hitAheadLimit = !inputDone && framesAhead >= aheadLimit
 
             if (!outputDone) {
-                val decoderStatus = decoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_USEC)
+                val decoderStatus = decoder.dequeueOutput(bufferInfo, TIMEOUT_USEC)
                 when {
                     decoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                         if (ALog.isDebug) ALog.d(TAG, "no output from decoder available")
+                        if (hitAheadLimit && extraAhead < MAX_EXTRA_AHEAD) {
+                            extraAhead++
+                        }
                     }
                     decoderStatus == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> ALog.d(TAG, "decoder output buffers changed")
                     decoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        ALog.i(TAG, "decoder output format changed: ${decoder.outputFormat}")
+                        ALog.i(TAG, "decoder output format changed: ${decoder.codec.outputFormat}")
                     }
                     decoderStatus < 0 -> {
                         throw RuntimeException("unexpected result from decoder.dequeueOutputBuffer: $decoderStatus")
                     }
                     else -> {
+                        extraAhead = 0
+                        if (framesAhead > 0) framesAhead--
                         var loop = 0
                         if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                             loop = --playLoop
@@ -232,9 +286,13 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                         val doRender = !outputDone
                         if (doRender) {
                             speedControlUtil.preRender(bufferInfo.presentationTimeUs)
+                            synchronized(presentLock) { presentPending = true }
                         }
 
-                        decoder.releaseOutputBuffer(decoderStatus, doRender)
+                        decoder.releaseOutput(decoderStatus, doRender)
+                        if (doRender) {
+                            awaitPresented()
+                        }
 
                         if (frameIndex == 0 && !isLoop) {
                             onVideoStart()
@@ -254,6 +312,8 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                             decoder.flush()
                             speedControlUtil.reset()
                             frameIndex = 0
+                            framesAhead = 0
+                            extraAhead = 0
                             isLoop = true
                         }
                         if (outputDone) {
@@ -266,30 +326,36 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
 
     }
 
-    private fun configureSurfaceDecoder(mime: String, format: MediaFormat): MediaCodec {
+    private fun configureSurfaceDecoder(mime: String, format: MediaFormat): CodecIo {
         val outputSurface = surface ?: throw IllegalStateException("surface is null")
         val width = format.getInteger(MediaFormat.KEY_WIDTH)
         val height = format.getInteger(MediaFormat.KEY_HEIGHT)
         val tuned = copyVideoFormat(format)
         applyDecoderMemoryHints(tuned)
-        val decoder = openDecoder(mime, width, height)
-        if (MediaUtil.supportsLowLatency(decoder.name, mime)) {
-            tuned.setInteger(MediaFormat.KEY_PRIORITY, 0)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                tuned.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        var decoder = openDecoder(mime, width, height)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && BlockCodecIo.isSupported(decoder)) {
+            try {
+                val io = BlockCodecIo.configure(decoder, tuned, outputSurface)
+                ALog.i(TAG, "decoder configured block model codec=${decoder.name} ${width}x$height")
+                return io
+            } catch (t: Throwable) {
+                ALog.e(TAG, "block model configure failed, use buffer mode", t)
+                releaseCodecQuietly(decoder)
+                decoder = openDecoder(mime, width, height)
             }
         }
+        // 不设实时优先级和低延迟。这两个标记会让解码器在 configure 时多留输出画面，开播内存会更高。
         return try {
             decoder.configure(tuned, outputSurface, null, 0)
             ALog.i(TAG, "decoder configured codec=${decoder.name} ${width}x$height max=${tuned.getInteger(MediaFormat.KEY_MAX_WIDTH)}x${tuned.getInteger(MediaFormat.KEY_MAX_HEIGHT)}")
-            decoder
+            SyncCodecIo(decoder)
         } catch (t: Throwable) {
             ALog.e(TAG, "memory-tuned configure failed, fallback", t)
             releaseCodecQuietly(decoder)
             val plain = openDecoder(mime, width, height)
             try {
                 plain.configure(format, outputSurface, null, 0)
-                plain
+                SyncCodecIo(plain)
             } catch (t2: Throwable) {
                 // 第二次 configure 也失败：释放刚创建的 codec，避免泄漏硬件解码器实例
                 releaseCodecQuietly(plain)
@@ -300,15 +366,9 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
 
     private fun openDecoder(mime: String, width: Int, height: Int): MediaCodec {
         val hardwareName = MediaUtil.findHardwareDecoderName(mime, width, height)
-        if (!hardwareName.isNullOrEmpty()) {
-            try {
-                ALog.i(TAG, "use hardware decoder $hardwareName")
-                return MediaCodec.createByCodecName(hardwareName)
-            } catch (t: Throwable) {
-                ALog.e(TAG, "createByCodecName $hardwareName failed", t)
-            }
-        }
-        return MediaCodec.createDecoderByType(mime)
+            ?: throw IllegalStateException("no hardware decoder")
+        ALog.i(TAG, "use hardware decoder $hardwareName")
+        return MediaCodec.createByCodecName(hardwareName)
     }
 
     private fun releaseCodecQuietly(codec: MediaCodec?) {
@@ -400,7 +460,16 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         dst.setByteBuffer(key, buffer.duplicate())
     }
 
-    private fun release(decoder: MediaCodec?, extractor: MediaExtractor?) {
+    private fun release(decoder: CodecIo?, extractor: MediaExtractor?) {
+        synchronized(releaseLock) {
+            if (released) {
+                ALog.i(TAG, "release skipped, already released")
+                return
+            }
+            released = true
+        }
+        // 解码线程可能正等着上屏。先放行，避免它等到超时才退出。
+        signalPresented()
         renderThread.handler?.post {
             ALog.i(TAG, "release")
             // 每一步独立 try：任意一步抛异常（例如 codec 处于 Error 状态时 stop() 会抛
@@ -418,6 +487,13 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
             releaseStep("releaseTexture") { render?.releaseTexture() }
             releaseStep("surface.release") { surface?.release() }
             surface = null
+            if (!player.isDegrading) {
+                // 播完就把 EGL 和窗口表面一起销毁。只删纹理会把 EGL 上下文、
+                // EGL 窗口缓冲（约两块输出尺寸的 RGBA）和 shader 一直留到 View 被拆除，
+                // 业务自己管理播放器时这部分内存不会自己降下来。下次播放 prepareRender 会重建。
+                releaseStep("destroyRender") { render?.destroyRender() }
+                render = null
+            }
             isRunning = false
             // 降级软解时不要触发 complete，否则 AnimView.hide() 会销毁 Surface
             if (!player.isDegrading) {

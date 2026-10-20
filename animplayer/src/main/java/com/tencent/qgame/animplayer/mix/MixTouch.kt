@@ -34,7 +34,7 @@ class MixTouch(private val mixAnimPlugin: MixAnimPlugin) {
             MotionEvent.ACTION_UP -> {
                 val x = ev.x * videoWith / viewWith.toFloat()
                 val y = ev.y * videoHeight / viewHeight.toFloat()
-                val list = mixAnimPlugin.frameAll?.map?.get(mixAnimPlugin.curFrameIndex)?.list
+                val list = mixAnimPlugin.framesAt(mixAnimPlugin.curFrameIndex)
                 list?.forEach {frame ->
                     val src = mixAnimPlugin.srcMap?.map?.get(frame.srcId) ?: return@forEach
                     if (calClick(x.toInt(), y.toInt(), frame.frame)) {

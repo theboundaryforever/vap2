@@ -16,13 +16,40 @@ void apply_decode_threads(AVCodecContext *codec_context, int threads) {
     if (codec_context == nullptr) {
         return;
     }
-    // 帧线程会按线程数额外保留解码帧。单线程时关掉，避免降级软解再翻几倍 YUV。
+    // 帧线程会按线程数额外保留解码帧。单线程时关掉帧线程和重排缓冲，少留参考帧。
     if (threads <= 1) {
         codec_context->thread_count = 1;
+        codec_context->thread_type = 0;
+        codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
         return;
     }
     codec_context->thread_count = threads;
     codec_context->thread_type = FF_THREAD_FRAME;
+}
+
+bool open_input_limited(AVFormatContext **format_context, const char *path) {
+    AVDictionary *options = nullptr;
+    // 默认探测会按约 5MB 预读。mp4 的封装头很小，把探测缓冲收短。
+    av_dict_set(&options, "probesize", "65536", 0);
+    av_dict_set(&options, "analyzeduration", "0", 0);
+    av_dict_set(&options, "fflags", "nobuffer", 0);
+    int opened = avformat_open_input(format_context, path, nullptr, &options);
+    av_dict_free(&options);
+    if (opened < 0) {
+        if (*format_context != nullptr) {
+            avformat_close_input(format_context);
+        }
+        opened = avformat_open_input(format_context, path, nullptr, nullptr);
+        if (opened < 0) {
+            return false;
+        }
+    }
+    if (*format_context != nullptr) {
+        (*format_context)->flags |= AVFMT_FLAG_NOBUFFER;
+        (*format_context)->probesize = 64 * 1024;
+        (*format_context)->max_analyze_duration = 0;
+    }
+    return true;
 }
 
 bool is_cancelled(JNIEnv *env, jobject session, jmethodID is_cancelled_method) {
@@ -215,7 +242,7 @@ int decode_to_raw_video(
         }
     }
 
-    if (avformat_open_input(&format_context, input_path, nullptr, nullptr) < 0) {
+    if (!open_input_limited(&format_context, input_path)) {
         goto cleanup;
     }
 
@@ -412,7 +439,7 @@ int decode_to_frames(
         }
     }
 
-    if (avformat_open_input(&format_context, input_path, nullptr, nullptr) < 0) {
+    if (!open_input_limited(&format_context, input_path)) {
         goto cleanup;
     }
     if (avformat_find_stream_info(format_context, nullptr) < 0) {
@@ -608,7 +635,7 @@ Java_com_arthenica_ffmpegkit_LiteFFmpegNative_probeVideoSize(
     int width = 0;
     int height = 0;
 
-    if (avformat_open_input(&format_context, input, nullptr, nullptr) == 0 &&
+    if (open_input_limited(&format_context, input) &&
         avformat_find_stream_info(format_context, nullptr) == 0) {
         for (unsigned int i = 0; i < format_context->nb_streams; ++i) {
             AVCodecParameters *parameters = format_context->streams[i]->codecpar;

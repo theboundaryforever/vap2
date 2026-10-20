@@ -28,6 +28,9 @@ class Resource(src: Src) {
     var tag = ""
     var bitmap: Bitmap? = null
     var curPoint: PointRect? = null  // src在当前帧的位置信息
+    // 这个元素在屏幕上的最大像素。调用方按它解码，避免先解出远超槽位的原图。
+    var targetWidth = 0
+    var targetHeight = 0
 
     init {
         id = src.srcId

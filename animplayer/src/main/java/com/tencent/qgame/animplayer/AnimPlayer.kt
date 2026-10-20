@@ -175,6 +175,8 @@ class AnimPlayer(val animView: IAnimView) {
             val config = configManager.config
             // 如果是默认配置，因为信息不完整onVideoConfigReady不会被调用
             if (config != null && (config.isDefaultConfig || animListener?.onVideoConfigReady(config) == true)) {
+                // 播放只用已经解析好的字段和帧对象，原始 JSON 不再留着。
+                config.jsonConfig = null
                 innerStartPlay(fileContainer)
             } else {
                 ALog.i(TAG, "onVideoConfigReady return false")

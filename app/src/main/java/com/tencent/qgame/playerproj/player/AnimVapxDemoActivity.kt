@@ -112,6 +112,17 @@ class AnimVapxDemoActivity : Activity(), IAnimListener {
                     head1Img = !head1Img
                     val options = BitmapFactory.Options()
                     options.inScaled = false
+                    if (resource.targetWidth > 0 && resource.targetHeight > 0) {
+                        options.inJustDecodeBounds = true
+                        BitmapFactory.decodeResource(resources, drawableId, options)
+                        options.inSampleSize = sampleSize(
+                            options.outWidth,
+                            options.outHeight,
+                            resource.targetWidth,
+                            resource.targetHeight
+                        )
+                        options.inJustDecodeBounds = false
+                    }
                     result(BitmapFactory.decodeResource(resources, drawableId, options))
                 } else {
                     result(null)
@@ -163,6 +174,18 @@ class AnimVapxDemoActivity : Activity(), IAnimListener {
         play(videoInfo)
     }
 
+
+    private fun sampleSize(srcW: Int, srcH: Int, reqW: Int, reqH: Int): Int {
+        var sample = 1
+        if (srcW > reqW || srcH > reqH) {
+            val halfW = srcW / 2
+            val halfH = srcH / 2
+            while (halfW / sample >= reqW && halfH / sample >= reqH) {
+                sample *= 2
+            }
+        }
+        return sample
+    }
 
     private fun play(videoInfo: VideoInfo) {
         // 播放前强烈建议检查文件的md5是否有改变

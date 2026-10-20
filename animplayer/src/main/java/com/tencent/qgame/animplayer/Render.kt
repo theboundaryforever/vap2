@@ -149,5 +149,13 @@ class Render(surfaceTexture: SurfaceTexture?, private val isSoftRender: Boolean 
         ALog.i(TAG, "updateViewPort: width=$width, height=$height")
     }
 
-    override fun releaseTexture() {}
+    override fun releaseTexture() {
+        if (textureId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+            textureId = 0
+        }
+        if (isSoftRender) {
+            GLES20.glDeleteTextures(3, yuvTextures, 0)
+        }
+    }
 }

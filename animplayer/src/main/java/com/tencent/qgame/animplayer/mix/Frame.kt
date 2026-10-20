@@ -17,7 +17,9 @@ package com.tencent.qgame.animplayer.mix
 
 import android.util.SparseArray
 import com.tencent.qgame.animplayer.PointRect
+import org.json.JSONException
 import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * 单帧
@@ -67,17 +69,47 @@ class FrameSet(json: JSONObject) {
 /**
  * 所有帧集合
  */
-class FrameAll(json: JSONObject) {
-    // 每一帧的集合
+class FrameAll {
+    // 每一帧的集合。只留绘制要用的数据，不留原始 JSON。
     val map = SparseArray<FrameSet>()
 
-    init {
+    constructor()
+
+    constructor(json: JSONObject) : this() {
         val frameJsonArray = json.getJSONArray("frame")
         val frameLen = frameJsonArray?.length() ?: 0
         for (i in 0 until frameLen) {
             val frameSetJson = frameJsonArray?.getJSONObject(i) ?: continue
             val frameSet = FrameSet(frameSetJson)
             map.put(frameSet.index, frameSet)
+        }
+    }
+
+    companion object {
+        /**
+         * 逐帧读入后立刻丢掉该帧的 JSON 节点。
+         * 不把整段 frame 数组建成一棵 JSONObject，解析峰值只剩当前这一帧。
+         */
+        fun readArray(tokener: JSONTokener): FrameAll {
+            val all = FrameAll()
+            if (tokener.nextClean() != '[') {
+                throw JSONException("frame array")
+            }
+            var separator = tokener.nextClean()
+            if (separator == ']') {
+                return all
+            }
+            tokener.back()
+            while (true) {
+                val frameSet = FrameSet(JSONObject(tokener))
+                all.map.put(frameSet.index, frameSet)
+                separator = tokener.nextClean()
+                when (separator) {
+                    ',' -> continue
+                    ']' -> return all
+                    else -> throw JSONException("frame array")
+                }
+            }
         }
     }
 }

@@ -15,12 +15,17 @@
  */
 package com.tencent.qgame.animplayer.mix
 
+import android.graphics.Bitmap
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.view.View
 import com.tencent.qgame.animplayer.AnimConfig
+import com.tencent.qgame.animplayer.AnimPlayer
 import com.tencent.qgame.animplayer.Constant
 import com.tencent.qgame.animplayer.PointRect
 import com.tencent.qgame.animplayer.util.*
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * vapx 渲染
@@ -41,22 +46,36 @@ class MixRender(private val mixAnimPlugin: MixAnimPlugin) {
         // shader 初始化
         shader = MixShader()
         GLES20.glDisable(GLES20.GL_DEPTH_TEST) // 关闭深度测试
+    }
 
-        mixAnimPlugin.srcMap?.map?.values?.forEach {src->
-            ALog.i(TAG, "init srcId=${src.srcId}")
-            val isTxt = src.srcType == Src.SrcType.TXT
-            // 文字 bitmap 上传后已回收，重建 GL 上下文（如降级软解）时需要重新生成
-            if (isTxt && src.bitmap?.isRecycled == true) {
-                src.bitmap = BitmapUtil.createTxtBitmap(src)
-            }
-            src.srcTextureId = TextureLoadUtil.loadTexture(src.bitmap)
-            // 文字 bitmap 由库内部生成，上传成纹理后不再需要 CPU 副本；图片 bitmap 归调用方，仍走 releaseResource
-            if (isTxt) {
-                src.bitmap?.recycle()
-            }
-            ALog.i(TAG, "textureProgram=${shader?.program},textureId=${src.srcTextureId}")
+    /**
+     * 只上传已经在内存里的这一张。没准备好的素材留到它进入播放窗口再传。
+     */
+    fun upload(src: Src) {
+        val config = mixAnimPlugin.player.configManager.config
+        val bitmap = src.bitmap ?: return
+        val upload = bitmapForUpload(src, config) ?: return
+        val textureId = TextureLoadUtil.loadTexture(upload)
+        if (upload !== bitmap && !upload.isRecycled) {
+            upload.recycle()
         }
+        if (textureId == 0) return
+        src.srcTextureId = textureId
+        mixAnimPlugin.releaseSrcAfterUpload(src)
+        ALog.i(TAG, "upload srcId=${src.srcId} textureId=$textureId")
+    }
 
+    /**
+     * 贴图按这个元素在屏幕上的最大像素生成。纹理坐标仍用设计尺寸，避免裁切计算错位。
+     * 调用方的原图不在这里回收，上传用的缩小图用完即弃。
+     */
+    private fun bitmapForUpload(src: Src, config: AnimConfig?): Bitmap? {
+        val bitmap = src.bitmap ?: return null
+        if (bitmap.isRecycled || config == null) return bitmap
+        val (outputW, outputH) = SrcBitmapScaler.outputSize(mixAnimPlugin.player)
+        val (slotW, slotH) = mixAnimPlugin.maxSlot(src)
+        val (targetW, targetH) = SrcBitmapScaler.targetSize(src, config, outputW, outputH, slotW, slotH)
+        return SrcBitmapScaler.scale(bitmap, targetW, targetH, src.srcId)
     }
 
     fun renderFrame(config:AnimConfig, frame:Frame, src: Src) {
@@ -156,5 +175,58 @@ class MixRender(private val mixAnimPlugin: MixAnimPlugin) {
         return argb
     }
 
+
+}
+
+/**
+ * 融合图只保留槽位在屏幕上的像素。设计尺寸乘显示缩放，不放大。
+ */
+internal object SrcBitmapScaler {
+
+    fun outputSize(player: AnimPlayer): Pair<Int, Int> {
+        if (player.outputSurfaceWidth > 0 && player.outputSurfaceHeight > 0) {
+            return player.outputSurfaceWidth to player.outputSurfaceHeight
+        }
+        val real = player.animView.getRealSize()
+        if (real.first > 0 && real.second > 0) return real
+        val view = player.animView as? View
+        return (view?.width ?: 0) to (view?.height ?: 0)
+    }
+
+    fun targetSize(
+        src: Src,
+        config: AnimConfig?,
+        outputWidth: Int,
+        outputHeight: Int,
+        slotWidth: Int,
+        slotHeight: Int,
+    ): Pair<Int, Int> {
+        val slotW = if (slotWidth > 0) slotWidth else src.w.coerceAtLeast(1)
+        val slotH = if (slotHeight > 0) slotHeight else src.h.coerceAtLeast(1)
+        val scale = if (config == null) {
+            1f
+        } else {
+            PlaybackSize.displayScale(config.width, config.height, outputWidth, outputHeight)
+        }
+        return (slotW * scale).roundToInt().coerceAtLeast(1) to
+            (slotH * scale).roundToInt().coerceAtLeast(1)
+    }
+
+    fun scale(bitmap: Bitmap, targetW: Int, targetH: Int, srcId: String): Bitmap {
+        if (bitmap.isRecycled || targetW <= 0 || targetH <= 0) return bitmap
+        if (bitmap.width <= targetW && bitmap.height <= targetH) return bitmap
+        val fit = min(targetW.toFloat() / bitmap.width, targetH.toFloat() / bitmap.height)
+        if (fit >= 0.99f) return bitmap
+        val width = (bitmap.width * fit).roundToInt().coerceAtLeast(1)
+        val height = (bitmap.height * fit).roundToInt().coerceAtLeast(1)
+        return try {
+            val scaled = Bitmap.createScaledBitmap(bitmap, width, height, true)
+            ALog.i("AnimPlayer.MixRender", "scale src $srcId ${bitmap.width}x${bitmap.height} -> ${width}x$height")
+            scaled
+        } catch (e: Throwable) {
+            ALog.e("AnimPlayer.MixRender", "scale src $srcId failed", e)
+            bitmap
+        }
+    }
 
 }
