@@ -40,6 +40,13 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         // 解码比正在显示的画面超前的样本数。再多，解码器就会把输出池里的全尺寸画面填满。
         private const val MAX_FRAMES_AHEAD = 1
         private const val MAX_EXTRA_AHEAD = 1
+        // 带 B 帧的流，解码器内部常驻重排缓冲：已送入未输出的帧里有重排深度那么多帧
+        // 是被解码器扣住等排序的，并不是真的“超前显示”（MTK 解码器对 750x814 的流
+        // 报 input.delay=4、output.delay=12 以上）。超前上限小于重排深度时，喂帧会
+        // 停在解码器吐帧之前：首帧不出、EOS 也喂不到，播放卡死且不报错。
+        // H.264/HEVC 的 DPB 与最大重排帧数上限都是 16，所以棘轮上限取 16，
+        // 保证任何合法码流最终都能填满重排管线。
+        private const val MAX_PIPELINE_EXTRA_AHEAD = 16
     }
 
     private var surface: Surface? = null
@@ -227,6 +234,10 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
         var isLoop = false
         var framesAhead = 0
         var extraAhead = 0
+        // 已实测需要的重排管线深度：只在真的卡住时逐级涨、整轮播放不回落。
+        // 无 B 帧的流不会卡住，在途帧数保持原来的紧限制；带 B 帧的流涨到
+        // 它实际的重排深度后即可 1 进 1 出地稳定播放。
+        var pipelineAhead = 0
 
         while (!outputDone) {
             if (isStopReq) {
@@ -235,13 +246,18 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                 return
             }
 
-            // Allow a caller to choose the conservative one-frame policy. Never allow
-            // more than one additional full-size codec output buffer.
+            // Allow a caller to choose the conservative one-frame policy, but floored
+            // by pipelineAhead: a cap below a B-frame decoder's reorder depth can
+            // never be satisfied and would deadlock playback (see constant comment).
             val configuredLimit = player.maxHardwareFramesAhead.coerceIn(
                 MAX_FRAMES_AHEAD,
                 MAX_FRAMES_AHEAD + MAX_EXTRA_AHEAD
             )
-            val aheadLimit = minOf(configuredLimit, MAX_FRAMES_AHEAD + extraAhead)
+            // 在途下限不能低于已实测的重排管线深度，否则带 B 帧的流永远等不到下一帧。
+            val aheadLimit = maxOf(
+                minOf(configuredLimit, MAX_FRAMES_AHEAD + extraAhead),
+                MAX_FRAMES_AHEAD + pipelineAhead
+            )
             while (!inputDone && framesAhead < aheadLimit) {
                 val inputBufIndex = decoder.dequeueInput(if (inputChunk == 0) TIMEOUT_USEC else 0L)
                 if (inputBufIndex < 0) {
@@ -269,7 +285,12 @@ class HardDecoder(player: AnimPlayer) : Decoder(player), SurfaceTexture.OnFrameA
                 when {
                     decoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                         if (ALog.isDebug) ALog.d(TAG, "no output from decoder available")
-                        if (hitAheadLimit && extraAhead < MAX_EXTRA_AHEAD &&
+                        if (hitAheadLimit && pipelineAhead < MAX_PIPELINE_EXTRA_AHEAD) {
+                            // 在途帧全被重排缓冲扣住时才会走到这里。逐级放宽并记住这个
+                            // 深度：extraAhead 那种“出帧就清零”的放宽会在稳态再次饿死管线。
+                            pipelineAhead++
+                            ALog.d(TAG, "output delayed; pipeline ahead now $pipelineAhead")
+                        } else if (hitAheadLimit && extraAhead < MAX_EXTRA_AHEAD &&
                             configuredLimit > MAX_FRAMES_AHEAD
                         ) {
                             extraAhead++
